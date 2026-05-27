@@ -1,10 +1,10 @@
 # vibe-ship
 
-A [Claude Code](https://claude.com/claude-code) skill that turns "I want to ship this change" into a single command. Installs as `/ship` — so you can say "ship this" (or type `/ship`) and Claude runs the whole end-to-end workflow with **exactly one approval gate**.
+A [Claude Code](https://claude.com/claude-code) skill that turns "I want to ship this change" into a single command. Installs as `/ship` — so you can say "ship this" (or type `/ship`) and Claude runs the whole end-to-end workflow with **two unskippable approval gates**: an intent check before commit, and a merge check after the cold review only when the reviewer flagged anything. Clean reviews auto-merge; everything else surfaces the gate so you can decide.
 
 ```
-write code → /ship → intent check (you say y) → branch + commit + push + PR
-        → cold AI review → squash-merge → cleanup → done
+write code → /ship → intent gate (you approve) → branch + commit + push + PR
+        → cold AI review → (clean → auto-merge / feedback → merge gate) → cleanup → done
 ```
 
 ## Who this is for
@@ -19,7 +19,8 @@ It assumes your repo auto-deploys on push to `main` (Railway, Render, Vercel, Fl
 
 Vibe-coding is fast, but speed alone produces sloppy commits, accidental secrets, half-broken doc links, and "fix later" debt that piles up. `vibe-ship` keeps the speed and adds back **just enough** discipline:
 
-- **One approval gate, not five.** You confirm intent once, in plain English, before anything ships. Everything after that runs automatically — no clicking through six prompts to land a one-line fix.
+- **One gate by default, two when it matters.** You confirm intent once, in plain English, before anything ships. The cold review either auto-merges on a clean APPROVE or surfaces a second gate when the reviewer flagged anything — no clicking through six prompts to land a one-line fix, but also no silently steamrolling over reviewer notes.
+- **Both gates are structured, not free-form.** Each one is a Claude Code question prompt with explicit options, so the pause is a visible artifact in the session — it can't be silently skipped even when the agent is operating autonomously.
 - **Cold AI review with no verdict-shopping.** A fresh Claude subagent reads the diff with zero session context. It doesn't know what you intended; it reads the code as a reviewer would. If it requests changes, the skill addresses them and pushes the fix — it does **not** re-dispatch the reviewer hoping for a different verdict. Reviewer hygiene by design.
 - **Audit trail on every PR.** The cold reviewer's full verdict gets posted as a PR comment. Months later, you can see what was checked, what was flagged, and what was fixed.
 - **Fast reverts when prod breaks.** If a smoke test fails after merge, the revert flow skips the cold review and ships immediately. Speed matters when prod is down.
