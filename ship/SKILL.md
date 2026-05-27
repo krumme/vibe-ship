@@ -1,6 +1,6 @@
 ---
 name: ship
-description: Ship a code change end-to-end on a GitHub repo. After writing code, runs branch → commit → push → PR → cold AI review → squash-merge → cleanup with exactly one approval gate (an intent check before commit). Optional smoke test if the project's CLAUDE.md has a `## Smoke test` section. Auto-invoke when the user says "ship this", "ship it", "deploy this", "push it up", "send it", or asks to fix/build something and ship it. Also available as `/ship`.
+description: Ship a code change end-to-end on a GitHub repo. After writing code, runs branch → commit → push → PR → cold AI review → squash-merge → cleanup with two unskippable approval gates (intent check before commit; merge check after cold review whenever the verdict has any feedback). A clean APPROVE with zero findings is the only path that auto-merges. Optional smoke test if the project's CLAUDE.md has a `## Smoke test` section. Auto-invoke when the user says "ship this", "ship it", "deploy this", "push it up", "send it", or asks to fix/build something and ship it. Also available as `/ship`.
 ---
 
 # /ship — end-to-end ship workflow
@@ -9,11 +9,14 @@ Designed for solo developers and small teams on GitHub repos that auto-deploy on
 
 ## Hard rules
 
-- **Exactly ONE approval gate**: step 4 (the intent check) is the only place to pause for a yes/no from the user before action. All other steps proceed automatically.
+- **Two gates, both UNSKIPPABLE, both via `AskUserQuestion`.**
+  - **Step 4 (intent gate)** fires every single time, before any commit. It is NOT a clarifying question — do not skip it because the session is in autonomous mode, because the user said "no questions," because the user already approved a plan that contains this work, or because the change feels obvious.
+  - **Step 7 (merge gate)** fires whenever the cold reviewer returns anything other than a clean APPROVE (verdict APPROVE + zero findings). Any [NOTE], any [BLOCKER], any COMMENT verdict → user gets to decide whether to merge, fix-then-merge, or abandon. A clean APPROVE is the only path that auto-merges.
+  - Both gates use `AskUserQuestion` so the pauses are visible artifacts in the transcript. If you reach step 8 without the intent gate having fired in the current ship cycle, OR without the merge gate having fired when the verdict was non-clean, you have violated the protocol.
 - **Cold review means cold**: the review subagent receives ONLY the PR URL and the review criteria below. Never share the prior conversation, the author's intent, alternatives considered, or any session context. The reviewer must read the diff fresh.
 - **No re-dispatch on REQUEST CHANGES**: address the blockers, push the fix, proceed to merge. Re-dispatching invites verdict-shopping.
 - **No cold review on reverts**: when prod is broken, speed matters.
-- **One ask per session**: if you ask the user about the rollback procedure and they decline or answer, don't ask again this session.
+- **One ask per session**: if you ask the user about the rollback procedure and they decline or answer, don't ask again this session. (The intent gate in step 4 is separate from this rule — it always fires.)
 
 ---
 
@@ -73,7 +76,11 @@ If they decline, continue without modifying CLAUDE.md. Don't re-prompt this sess
 
 ## Step 4 — Intent check (THE approval gate)
 
-Print to terminal, in plain English:
+This step is **mandatory and unskippable** — see the hard rule at the top of this skill. Even if the user has told you not to stop for clarifying questions, even if they pre-approved a plan that includes this work, you still run this gate. It is the only place you ever pause inside `/ship`, so honoring it is non-negotiable.
+
+**Implementation: use `AskUserQuestion`, not "print and wait."** A structured tool call leaves a visible artifact in the transcript, which makes the gate auditable and harder to accidentally skip. Free-form "approve? (y/n)" prompts have been skipped in practice when session-level instructions tell the agent to work autonomously — the structured form prevents that drift.
+
+**Before calling the tool**, print the intent paragraph to the terminal so the user has it in front of them when they answer:
 
 ```
 What this does
@@ -84,14 +91,23 @@ This is what gets shown to a colleague who didn't write the change.}
 
 Branch: {branch-name}
 Files changing: {comma-separated list}
-
-Approve? (y / push back with feedback)
 ```
 
-Wait for the user.
+**Then call `AskUserQuestion`** with this exact shape:
 
-- **`y` or any clear approval** → proceed to step 5.
-- **Push-back** → incorporate the feedback (adjust code, adjust the paragraph, or both), reprint, ask again. Loop until approved.
+- `question`: `"Approve this PR's intent paragraph?"`
+- `header`: `"Ship gate"`
+- `multiSelect`: `false`
+- `options`:
+  - `label`: `"Approve and proceed"`, `description`: `"Commit, push, open PR, run cold review."`
+  - `label`: `"Push back with feedback"`, `description`: `"Adjust the code or the paragraph and re-ask."`
+
+The user picks one of those, or uses the free-form "Other" field to write specific feedback.
+
+Handle the response:
+
+- **"Approve and proceed"** (and no contradictory notes) → proceed to step 5.
+- **"Push back with feedback"**, or **"Other" with text**, or any answer that includes notes asking for changes → incorporate the feedback (adjust code, adjust the paragraph, or both), reprint the paragraph, and call `AskUserQuestion` again. Loop until approval is clean.
 
 ## Step 5 — Commit, push, open PR
 
@@ -189,19 +205,46 @@ Also print the verdict to the terminal so the user sees it immediately.
 
 ## Step 7 — Verdict handling
 
-**APPROVE** → proceed to step 8 automatically. The user already approved the intent in step 4; no second gate.
+The rule: **clean APPROVE → auto-merge. Any feedback at all → second gate.**
 
-**REQUEST CHANGES** →
-1. Print the blockers
-2. Address each one in code
-3. Commit with message like `Address review: <one-line>` (same Co-Authored-By trailer)
-4. Push to the same branch — the PR auto-updates
-5. Proceed to step 8
-6. **Do NOT re-dispatch the cold reviewer.** The original verdict + the fix on the PR is the audit trail.
+A "clean APPROVE" means verdict is APPROVE *and* the Findings block is empty (no [BLOCKER] and no [NOTE] items). Anything else — APPROVE with notes, any REQUEST CHANGES, any COMMENT — triggers the second `AskUserQuestion` gate. This gate is structurally identical to step 4: a visible artifact in the transcript so the agent can't silently steamroll past reviewer feedback.
 
-**COMMENT** (verdict is ambiguous, no clear APPROVE / REQUEST CHANGES) →
-- Print the verdict
-- Ask the user how to proceed (merge, address, or abandon)
+**Clean APPROVE (verdict APPROVE + zero findings)** → proceed to step 8 automatically. No second gate, the cold review was a clean win.
+
+**All other verdicts** → run the second gate.
+
+### Second gate (only fires on non-clean verdicts)
+
+First, print a paragraph to the terminal that (a) relays what the cold reviewer said and (b) explains what you plan to do about it. Plain language, no jargon. Example shape:
+
+```
+Cold review came back with {verdict}. {One sentence summary of the blockers/notes.}
+
+My plan: {what you'd do if approved — e.g. "merge as-is", "address the
+typo flag then merge", "fix the two blockers, push, then merge".}
+```
+
+Then call `AskUserQuestion`. The exact options depend on the verdict:
+
+- **APPROVE + notes:**
+  - `"Merge as-is"` — "Notes are advisory; ship the PR."
+  - `"Address notes then merge"` — "Fix the notes, push, then merge."
+- **REQUEST CHANGES** (always has blockers):
+  - `"Address blockers and merge"` — "Fix the blockers, push, then merge."
+  - `"Push back on verdict"` — "Disagree with one or more blockers; merge as-is."
+- **COMMENT** (ambiguous):
+  - `"Merge"` — "Treat as APPROVE, ship the PR."
+  - `"Address feedback then merge"` — "Fix what the reviewer raised, push, then merge."
+  - `"Abandon"` — "Close the PR without merging."
+
+Use `header: "Merge gate"` for all three. `multiSelect: false`. The user can also pick "Other" to write specific instructions.
+
+Then act on the answer:
+
+- **Merge as-is / Merge / Push back on verdict** → proceed to step 8.
+- **Address ... then merge** → fix the issues in code, commit with a message like `Address review: <one-line>` (same `Co-Authored-By` trailer), push to the same branch, then proceed to step 8. **Do NOT re-dispatch the cold reviewer** — the original verdict comment plus the fix commit IS the audit trail. Re-dispatching invites verdict-shopping.
+- **Abandon** → stop. Leave the PR open for the user to close manually or pick up later. Do not delete the branch.
+- **Other with custom instructions** → follow them. If they describe fixing then merging, address the issues and proceed to step 8.
 
 ## Step 8 — Merge, cleanup, done (or hand off to smoke test)
 
